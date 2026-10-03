@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Chat + Video Call</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; }
+  /* Hidden until the user is in a room / a peer is present */
+  #roomInfo, #chatForm, #videos, #callBtn { display: none; }
+  #joinCode { text-transform: uppercase; width: 8ch; }
+  #videos { gap: 8px; margin: 12px 0; }
+  #videos video { width: 50%; background: #000; border-radius: 6px; }
+  #messages { height: 240px; overflow-y: auto; border: 1px solid #ccc; border-radius: 6px; padding: 8px; margin: 12px 0; }
+  .system { color: #777; font-size: 0.9em; margin: 4px 0; }
+  .msg { margin: 4px 0; }
+  .msg .user { font-weight: 600; }
+  .msg.me .user { color: #1a6fd1; }
+  #chatForm { gap: 8px; }
+  #chatForm input { flex: 1; padding: 6px; }
+</style>
+</head>
+<body>
+<h1>Chat + Video Call</h1>
+
+<section id="lobby">
+  <button id="createBtn">Create a room</button>
+  &nbsp; or &nbsp;
+  <input id="joinCode" placeholder="ROOM CODE" maxlength="5" />
+  <button id="joinBtn">Join</button>
+</section>
+
+<section id="roomInfo">
+  Room code: <strong id="roomCode"></strong> — share this with the other person.
+  <button id="callBtn">Start video call</button>
+</section>
+
+<div id="videos">
+  <video id="localVideo" autoplay playsinline muted></video>
+  <video id="remoteVideo" autoplay playsinline></video>
+</div>
+
+<div id="messages"></div>
+<form id="chatForm">
+  <input id="text" autocomplete="off" placeholder="Type a message..." />
+  <button type="submit">Send</button>
+</form>
+
+<script>
+// =============================================================
+// PART 1: WebSocket connection and message handling
+// =============================================================
+const proto = location.protocol === "https:" ? "wss://" : "ws://";
+const ws = new WebSocket(proto + location.host);
+
+const lobbyEl = document.getElementById("lobby");
+const roomInfoEl = document.getElementById("roomInfo");
+const roomCodeEl = document.getElementById("roomCode");
+const createBtn = document.getElementById("createBtn");
+const joinBtn = document.getElementById("joinBtn");
+const joinCodeEl = document.getElementById("joinCode");
+const messagesEl = document.getElementById("messages");
+const chatFormEl = document.getElementById("chatForm");
+const textEl = document.getElementById("text");
+const callBtn = document.getElementById("callBtn");
+const videosEl = document.getElementById("videos");
+const localVideoEl = document.getElementById("localVideo");
+const remoteVideoEl = document.getElementById("remoteVideo");
+
+function addSystem(text) {
+  const div = document.createElement("div");
+  div.className = "system";
+  div.textContent = text;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function addMessage(text, mine) {
+  const div = document.createElement("div");
+  div.className = "msg " + (mine ? "me" : "them");
+  div.innerHTML = `<span class="user"></span> <span class="text"></span>`;
+  div.querySelector(".user").textContent = mine ? "You:" : "Them:";
+  div.querySelector(".text").textContent = text;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// Safe send: only when the socket is actually open.
+function wsSend(obj) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  } else {
+    addSystem("Not connected to server.");
+  }
+}
+
+ws.addEventListener("open", () => addSystem("Connected to server."));
+ws.addEventListener("close", () => {
+  addSystem("Disconnected.");
+  endCall();
+});
+ws.addEventListener("error", () => addSystem("Connection error."));
+
+ws.addEventListener("message", (event) => {
+  let msg;
+  try {
+    msg = JSON.parse(event.data);
+  } catch {
+    return;
+  }
+
+  switch (msg.type) {
+    case "room_created":
+      enterRoom(msg.roomId);
+      addSystem("Room created. Waiting for the other person...");
+      break;
+    case "joined":
+      enterRoom(msg.roomId);
+      addSystem("Joined room " + msg.roomId);
+      callBtn.style.display = "inline-block";
+      break;
+    case "peer_joined":
+      addSystem("The other person joined. You can start chatting or start a video call.");
+      callBtn.style.display = "inline-block";
+      break;
+    case "peer_left":
+      addSystem("The other person left.");
+      callBtn.style.display = "none";
+      endCall();
+      break;
+    case "chat":
+      addMessage(msg.text, false);
+      break;
+    case "signal":
+      handleSignal(msg.data).catch((err) => {
+        console.error("Signaling error:", err);
+        addSystem("Call error: " + err.message);
+      });
+      break;
+    case "error":
+      addSystem("Error: " + msg.message);
+      break;
+  }
+});
+
+function enterRoom(roomId) {
+  lobbyEl.style.display = "none";
+  roomInfoEl.style.display = "block";
+  roomCodeEl.textContent = roomId;
+  chatFormEl.style.display = "flex";
+}
+
+createBtn.addEventListener("click", () => {
+  wsSend({ type: "create_room" });
+});
+
+joinBtn.addEventListener("click", () => {
+  const roomId = joinCodeEl.value.trim().toUpperCase();
+  if (!roomId) return;
+  wsSend({ type: "join_room", roomId });
+});
+
+joinCodeEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") joinBtn.click();
+});
+
+chatFormEl.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = textEl.value.trim();
+  if (!text) return;
+  wsSend({ type: "chat", text });
+  addMessage(text, true);
+  textEl.value = "";
+});
+
+// =============================================================
+// PART 2: WebRTC, signaled over the same WebSocket
+// =============================================================
+let pc = null;
+let localStream = null;
+// ICE candidates that arrive before the remote description is set
+// (e.g. while the callee is still answering the camera permission prompt).
+let pendingCandidates = [];
+
+// Starts as plain STUN, then gets replaced with the server-provided list
+// (STUN + TURN) as soon as /ice-config responds. Fetching it at page load
+// means it's normally ready long before anyone clicks "Start video call".
+let rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+async function loadIceServers() {
+  try {
+    const res = await fetch("/ice-config");
+    const { iceServers } = await res.json();
+    if (Array.isArray(iceServers) && iceServers.length) {
+      rtcConfig = { iceServers };
+    }
+  } catch (err) {
+    console.warn("Using default STUN only:", err);
+  }
+}
+const iceReady = loadIceServers();
+
+async function getLocalMedia() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Camera/mic need HTTPS (or localhost).");
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  localStream = stream;
+  localVideoEl.srcObject = stream;
+  videosEl.style.display = "flex";
+  return stream;
+}
+
+async function startCall() {
+  try {
+    await getLocalMedia();
+  } catch (err) {
+    addSystem("Could not access camera/mic: " + err.message);
+    callBtn.style.display = "inline-block";
+    return;
+  }
+
+  await iceReady;
+  pc = createPeerConnection();
+  for (const track of localStream.getTracks()) {
+    pc.addTrack(track, localStream);
+  }
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  sendSignal({ kind: "offer", sdp: pc.localDescription });
+}
+
+function createPeerConnection() {
+  const conn = new RTCPeerConnection(rtcConfig);
+
+  conn.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendSignal({ kind: "ice-candidate", candidate: event.candidate });
+    }
+  };
+
+  conn.ontrack = (event) => {
+    remoteVideoEl.srcObject = event.streams[0];
+  };
+
+  conn.onconnectionstatechange = () => {
+    if (conn.connectionState === "failed") {
+      addSystem("Video connection failed (a TURN server may be needed on this network).");
+    }
+  };
+
+  return conn;
+}
+
+function sendSignal(data) {
+  wsSend({ type: "signal", data });
+}
+
+async function flushPendingCandidates() {
+  const queued = pendingCandidates;
+  pendingCandidates = [];
+  for (const c of queued) {
+    try {
+      await pc.addIceCandidate(c);
+    } catch (err) {
+      console.warn("Failed to add queued ICE candidate:", err);
+    }
+  }
+}
+
+async function handleSignal(data) {
+  if (!data) return;
+
+  if (data.kind === "offer") {
+    // Callee: someone is calling us. Stop any stale call first.
+    callBtn.style.display = "none";
+    if (pc) endCall();
+
+    // Mark that a call is being set up so incoming candidates get queued
+    // (pc is still null while we wait on the permission prompt).
+    try {
+      await getLocalMedia();
+    } catch (err) {
+      addSystem("Could not access camera/mic: " + err.message);
+      callBtn.style.display = "inline-block";
+      return;
+    }
+
+    await iceReady;
+    pc = createPeerConnection();
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
+
+    await pc.setRemoteDescription(data.sdp);
+    await flushPendingCandidates();
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    sendSignal({ kind: "answer", sdp: pc.localDescription });
+  } else if (data.kind === "answer") {
+    if (!pc) return;
+    await pc.setRemoteDescription(data.sdp);
+    await flushPendingCandidates();
+  } else if (data.kind === "ice-candidate") {
+    if (pc && pc.remoteDescription) {
+      try {
+        await pc.addIceCandidate(data.candidate);
+      } catch (err) {
+        console.warn("Failed to add ICE candidate:", err);
+      }
+    } else {
+      pendingCandidates.push(data.candidate);
+    }
+  }
+}
+
+function endCall() {
+  if (pc) {
+    pc.onicecandidate = null;
+    pc.ontrack = null;
+    pc.close();
+    pc = null;
+  }
+  if (localStream) {
+    localStream.getTracks().forEach((t) => t.stop());
+    localStream = null;
+  }
+  pendingCandidates = [];
+  localVideoEl.srcObject = null;
+  remoteVideoEl.srcObject = null;
+  videosEl.style.display = "none";
+}
+
+callBtn.addEventListener("click", () => {
+  callBtn.style.display = "none";
+  startCall().catch((err) => {
+    console.error(err);
+    addSystem("Call error: " + err.message);
+    callBtn.style.display = "inline-block";
+  });
+});
+</script>
+</body>
+</html>

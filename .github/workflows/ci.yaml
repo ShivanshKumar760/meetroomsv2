@@ -1,0 +1,56 @@
+# .github/workflows/ci.yml
+name: ci
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPO: chat-video
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::114614701236:role/GitHubActionsECRPush   # your real Account ID
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}
+
+  bump-manifests:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ShivanshKumar760/gitops
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy
+      - uses: imranismail/setup-kustomize@v2
+      - name: Bump image tag
+        working-directory: deploy/chat-video/overlays/staging
+        run: kustomize edit set image chat-video=*:${{ needs.build-and-push.outputs.tag }}
+      - name: Commit and push
+        working-directory: deploy
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add .
+          git commit -m "chat-video ${{ needs.build-and-push.outputs.tag }}"
+          git push
