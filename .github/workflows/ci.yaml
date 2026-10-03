@@ -23,7 +23,7 @@ jobs:
         run: echo "tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::114614701236:role/GitHubActionsECRPush   # your real Account ID
+          role-to-assume: arn:aws:iam::114614701236:role/GitHubActionsECRPush  # your real Account ID
           aws-region: ${{ env.AWS_REGION }}
       - id: ecr
         uses: aws-actions/amazon-ecr-login@v2
